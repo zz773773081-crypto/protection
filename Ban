@@ -1,0 +1,452 @@
+-- ============================================================
+-- SAAD Layer-3 Titan — deep multi-layer anti-AC shield
+-- file: saad_titan.lua
+-- ============================================================
+
+local _G, pcall, xpcall, type, tostring, tonumber, pairs, ipairs =
+      _G, pcall, xpcall, type, tostring, tonumber, pairs, ipairs
+local rawget, rawset, setmetatable, getmetatable = rawget, rawset, setmetatable, getmetatable
+local math, string, table, os, debug = math, string, table, os, debug
+local select, unpack = select, unpack or table.unpack
+local require, load, loadstring = require, load, loadstring
+
+-- ============================================================
+-- L0 — Sealed state (weak-ref, hidden from _G walkers)
+-- ============================================================
+local T = setmetatable({}, { __mode = "k" })
+local S3 = {
+    epoch   = 0,
+    ticks   = 0,
+    active  = false,
+    hooks   = {},
+    ghosts  = {},
+    killed  = {},
+    log     = {},
+    entropy = 0,
+}
+
+-- ============================================================
+-- L1 — Entropy pool (drives random jitter + rolling keys)
+-- ============================================================
+local function brew_entropy()
+    S3.entropy = (S3.entropy * 1103515245 + 12345 + math.floor(os.clock() * 1e7)) % 2^31
+    return S3.entropy
+end
+
+-- ============================================================
+-- L2 — Rolling XOR cipher (key mutates per call)
+-- ============================================================
+local MASTER = 0x6B
+local function roll_key(i, salt)
+    return (MASTER + i * 13 + salt + (S3.entropy % 251)) % 256
+end
+
+local function dec(bytes, salt)
+    salt = salt or 0
+    local o = {}
+    for i = 1, #bytes do
+        o[i] = string.char((bytes[i] ~ roll_key(i, salt)) % 256)
+    end
+    return table.concat(o)
+end
+
+-- ============================================================
+-- L3 — Encoded symbol table (no plaintext literals anywhere)
+-- ============================================================
+local SEEDS = {
+    SendRPC        = dec({0x26,0x0F,0x30,0x3A,0x39,0x30,0x33,0x30}, 3),
+    GameplayCB     = dec({0x2C,0x01,0x0D,0x0D,0x0D,0x0B,0x1C,0x1E,0x3B,0x3F,0x3B,0x3C,0x3A,0x36,0x3C,0x2F,0x37,0x0E,0x0B,0x0D,0x0B,0x05}, 7),
+    SubsystemMgr   = dec({0x26,0x01,0x3D,0x30,0x3B,0x37,0x36,0x3C,0x38,0x2B,0x0D,0x0C,0x0E,0x3D,0x3B,0x3A,0x0D,0x0C,0x0E,0x0B,0x35,0x0D,0x0C,0x38,0x38,0x30,0x33,0x36,0x32,0x3F,0x2B,0x35,0x3C,0x0D,0x2F,0x0B,0x0C,0x0C,0x0D,0x3A}, 11),
+    NetUtil        = dec({0x2D,0x3B,0x2C,0x2F,0x3D,0x0C,0x3B,0x2C}, 1),
+    SystemInfo     = dec({0x26,0x38,0x3B,0x2C,0x3D,0x3B,0x2C,0x36,0x3C,0x33,0x3B,0x2C,0x3D,0x3B,0x2C,0x36,0x3C}, 5),
+    FFileHelper    = dec({0x0C,0x3C,0x3F,0x30,0x3E,0x3C,0x3F,0x30,0x3E,0x3C,0x3D,0x3B,0x2C,0x3C,0x0C,0x3B,0x2C,0x36,0x3D,0x30,0x3C}, 13),
+    TssSdk         = dec({0x2D,0x3B,0x3C,0x3B,0x26,0x3D,0x36}, 9),
+    SwiftHawk      = dec({0x26,0x38,0x3B,0x2C,0x3D,0x3B,0x2C,0x36,0x3C,0x38,0x3B,0x30}, 17),
+    CoronaLab      = dec({0x2C,0x30,0x2B,0x30,0x30,0x36,0x3D,0x3B,0x36,0x3B,0x2B,0x3B}, 23),
+    CrashSight     = dec({0x2C,0x3B,0x2C,0x3D,0x2B,0x36,0x3B,0x3C,0x2B,0x2C,0x30,0x2D}, 29),
+    Buggly         = dec({0x2C,0x3B,0x3C,0x2C,0x3C,0x30,0x3B,0x2C,0x36,0x3D,0x30,0x3B,0x36}, 31),
+    TLog           = dec({0x2D,0x3B,0x2C,0x3B,0x0C,0x30,0x32}, 37),
+    HiggsBoson     = dec({0x2D,0x3B,0x2C,0x3B,0x26,0x38,0x3B,0x2C,0x3D,0x3B,0x2C,0x36,0x3C,0x26,0x38,0x3B,0x2C,0x3D,0x3B,0x2C,0x36,0x3C}, 41),
+}
+
+local SIGS = {
+    dec({0x2D,0x3B,0x3C,0x30,0x32,0x36,0x3C,0x3B,0x2C,0x30}, 2),
+    dec({0x2D,0x3B,0x3C,0x30,0x32,0x36,0x3C,0x3B,0x2C,0x30,0x36,0x30,0x2D,0x0C,0x30,0x32,0x3B}, 4),
+    dec({0x2D,0x3B,0x3C,0x30,0x32,0x3D,0x2C,0x3B,0x2C,0x30}, 6),
+    dec({0x2C,0x3B,0x2C,0x3C,0x30,0x3D,0x2C,0x30,0x3B,0x2C,0x0C}, 8),
+    dec({0x2D,0x3B,0x3C,0x30,0x32,0x0E,0x30,0x3C,0x3B,0x2C,0x30,0x32,0x36}, 10),
+    dec({0x2C,0x3B,0x2C,0x0E,0x36,0x3B,0x2C,0x0D,0x3B,0x2C,0x3C}, 12),
+    dec({0x2C,0x3B,0x2C,0x3F,0x30,0x3E,0x3C,0x3F,0x30,0x3E}, 14),
+    dec({0x2D,0x3B,0x3C,0x30,0x32,0x0C,0x3B,0x2C,0x3C}, 16),
+    dec({0x2C,0x3B,0x2C,0x3F,0x30,0x3E,0x3C,0x3F,0x30,0x3E,0x2B,0x2F,0x2C}, 18),
+    dec({0x2D,0x3B,0x3C,0x30,0x32,0x0C,0x30,0x32,0x3B,0x3F,0x2C}, 20),
+    dec({0x2D,0x3B,0x3C,0x30,0x32,0x26,0x38,0x3B,0x2C,0x3D,0x3B,0x2C,0x36,0x3C}, 22),
+    dec({0x2C,0x3B,0x2C,0x3F,0x30,0x3E,0x3C,0x3F,0x30,0x3E,0x26,0x38,0x3B,0x2C,0x3D,0x3B,0x2C,0x36,0x3C}, 24),
+    dec({0x2D,0x3B,0x3C,0x30,0x32,0x0E,0x30,0x3C,0x3B,0x2C}, 26),
+    dec({0x2D,0x3B,0x3C,0x30,0x32,0x26,0x30,0x32,0x3D,0x3B,0x2C,0x30,0x3E}, 28),
+    dec({0x2D,0x3B,0x3C,0x30,0x32,0x0C,0x3B,0x2C,0x3C,0x3B,0x3C}, 30),
+    dec({0x2D,0x3B,0x3C,0x30,0x32,0x26,0x30,0x32,0x3D,0x3B,0x2C,0x30,0x3D}, 32),
+    dec({0x2C,0x3B,0x2C,0x3F,0x30,0x3E,0x3C,0x3F,0x30,0x3E,0x2B,0x30,0x2D,0x3B,0x36,0x32,0x3C}, 34),
+    dec({0x2D,0x3B,0x3C,0x30,0x32,0x0E,0x30,0x3C,0x3B,0x2C}, 36),
+    dec({0x2C,0x3B,0x2C,0x3F,0x30,0x3E,0x3C,0x3F,0x30,0x3E,0x2B,0x3B,0x32,0x3C,0x30}, 38),
+    dec({0x2D,0x3B,0x3C,0x30,0x32,0x0C,0x30,0x32,0x3B,0x3F,0x3C}, 40),
+    dec({0x2D,0x3B,0x3C,0x30,0x32,0x26,0x30,0x32,0x3D,0x3B,0x2C,0x30,0x3E,0x36}, 42),
+}
+
+local function sig(name)
+    if type(name) ~= "string" then return false end
+    local l = string.lower(name)
+    for i = 1, #SIGS do
+        if string.find(l, string.lower(SIGS[i]), 1, true) then return true end
+    end
+    return false
+end
+
+-- ============================================================
+-- L4 — Memory-safe hook installer
+-- ============================================================
+local function install(tbl, key, wrapper)
+    if type(tbl) ~= "table" then return false end
+    local orig = rawget(tbl, key)
+    if type(orig) ~= "function" then return false end
+    S3.hooks[tbl] = S3.hooks[tbl] or {}
+    if S3.hooks[tbl][key] then return true end
+    S3.hooks[tbl][key] = { orig = orig, wrapper = wrapper }
+    rawset(tbl, key, wrapper)
+    return true
+end
+
+local function uninstall_all()
+    for tbl, keys in pairs(S3.hooks) do
+        for k, rec in pairs(keys) do
+            pcall(function() rawset(tbl, k, rec.orig) end)
+        end
+    end
+    S3.hooks = {}
+end
+
+local function voide() return nil end
+local function tru()  return true end
+local function fls()  return false end
+
+-- ============================================================
+-- L5 — TSS SDK full suppression
+-- ============================================================
+local function kill_tss()
+    pcall(function()
+        local t = rawget(_G, SEEDS.TssSdk) or rawget(_G, "TssSdk")
+        if not t then return end
+        for k, v in pairs(t) do
+            if type(v) == "function" and sig(k) then
+                install(t, k, voide)
+            end
+        end
+        if rawget(t, "IsEmulator") then install(t, "IsEmulator", fls) end
+        if rawget(t, "CheckEnvironment") then install(t, "CheckEnvironment", tru) end
+        if rawget(t, "VerifyProcess") then install(t, "VerifyProcess", tru) end
+    end)
+end
+
+-- ============================================================
+-- L6 — Hawk family (SwiftHawk, CoronaLab, HawkEye, DS)
+-- ============================================================
+local function kill_hawks()
+    pcall(function()
+        local names = {
+            SEEDS.SwiftHawk, SEEDS.CoronaLab,
+            "SwiftHawk", "ClientSwiftHawk", "ClientSwiftHawkWithParams",
+            "SendSwiftHawkData", "CoronaLab", "ClientHawkEyePatrol",
+        }
+        for _, n in ipairs(names) do
+            if rawget(_G, n) then rawset(_G, n, voide) end
+        end
+        local c = rawget(_G, "CoronaLab")
+        if type(c) == "table" then
+            for k, v in pairs(c) do
+                if type(v) == "function" and sig(k) then install(c, k, voide) end
+            end
+        end
+    end)
+end
+
+-- ============================================================
+-- L7 — Subsystem deep-walker (recursive, guarded)
+-- ============================================================
+local function deep_patch(t, d)
+    d = d or 0
+    if d > 4 or type(t) ~= "table" or t == S3.hooks then return end
+    for k, v in pairs(t) do
+        if type(v) == "function" and sig(k) then
+            pcall(install, t, k, voide)
+        elseif type(v) == "table" and d < 4 then
+            pcall(deep_patch, v, d + 1)
+        end
+    end
+end
+
+local function kill_subsystems()
+    pcall(function()
+        local ok, SM = pcall(require, "GameLua.GameCore.Module.Subsystem.SubsystemMgr")
+        if not ok then SM = rawget(_G, "SubsystemMgr") end
+        if not SM or type(SM.Get) ~= "function" then return end
+        local targets = {
+            "ClientKernelCheckSubsystem","ClientMemoryGuardSubsystem",
+            "ClientDataStatistcsSubsystem","AFKReportorSubsystem",
+            "AvatarExceptionSubsystem","ShootVerifySubSystemClient",
+            "MemoryCheckSubsystem","SpeedCheckSubsystem","WallCheckSubsystem",
+            "FileCheckSubsystem","BehaviorScoreSubsystem","GameReportSubsystem",
+            "ClientSecMrpcsFlowSubsystem","MrpcsFlowSubsystem","CircleFlowSubsystem",
+            "SwiftHawkSubsystem","AntiCheatSubsystem","IntegrityCheckSubsystem",
+            "SignatureVerifySubsystem","MD5CheckSubsystem","PakVerifySubsystem",
+            "PlayerSecurityInfoSubsystem","CoronaLabSubsystem","ModifierExceptionSubsystem",
+            "ClientHawkEyePatrolSubsystem","DSHawkEyePatrolSubsystem",
+            "ReplaySubsystem","SimulateCharacterSubsystem",
+            "KernelCheckSubsystem","DataFlowSubsystem",
+        }
+        for _, n in ipairs(targets) do
+            local ok2, sub = pcall(SM.Get, SM, n)
+            if ok2 and type(sub) == "table" then
+                S3.killed[n] = true
+                deep_patch(sub, 0)
+            end
+        end
+    end)
+end
+
+-- ============================================================
+-- L8 — Network packet + RPC double filter
+-- ============================================================
+local function kill_network()
+    pcall(function()
+        local NU = rawget(_G, "NetUtil")
+        if type(NU) == "table" and rawget(NU, "SendPacket") then
+            install(NU, "SendPacket", function(self, name, ...)
+                if sig(name) then return nil end
+                return S3.hooks[NU]["SendPacket"].orig(self, name, ...)
+            end)
+        end
+    end)
+    pcall(function()
+        local SR = rawget(_G, "SendRPC")
+        if type(SR) ~= "function" then return end
+        local w = function(self, name, ...)
+            if sig(name) then return nil end
+            return SR(self, name, ...)
+        end
+        S3.hooks[_G] = S3.hooks[_G] or {}
+        S3.hooks[_G]["SendRPC"] = { orig = SR, wrapper = w }
+        rawset(_G, "SendRPC", w)
+    end)
+end
+
+-- ============================================================
+-- L9 — Global function sweep
+-- ============================================================
+local function kill_globals()
+    pcall(function()
+        for k, v in pairs(_G) do
+            if type(v) == "function" and sig(k) then
+                rawset(_G, k, voide)
+            end
+        end
+    end)
+end
+
+-- ============================================================
+-- L10 — Crash / telemetry suppression
+-- ============================================================
+local function kill_crash()
+    pcall(function()
+        for _, name in ipairs({ "Buggly", "CrashSight", "TLog" }) do
+            local m = rawget(_G, name)
+            if type(m) == "table" then
+                for k, v in pairs(m) do
+                    if type(v) == "function" and sig(k) then install(m, k, voide) end
+                end
+            end
+        end
+    end)
+end
+
+-- ============================================================
+-- L11 — File integrity spoof
+-- ============================================================
+local fake_cache = {}
+local function seed()
+    if not fake_cache.s then
+        math.randomseed(os.time() + math.floor(os.clock() * 1e6))
+        fake_cache.s = math.random(0, 2^30)
+    end
+    return fake_cache.s
+end
+
+local function hx(n, salt)
+    local s = seed() + (salt or 0)
+    local o = {}
+    for i = 1, n * 2 do
+        s = (s * 1103515245 + 12345) % 2^31
+        o[i] = string.format("%x", s % 16)
+    end
+    return table.concat(o)
+end
+
+local function kill_file()
+    pcall(function()
+        local ok, FH = pcall(require, "FFileHelper")
+        if not ok then FH = rawget(_G, "FFileHelper") end
+        if type(FH) ~= "table" then return end
+        if rawget(FH, "GetFileSize") then
+            install(FH, "GetFileSize", function(self, p, ...)
+                if type(p) == "string" and p:lower():find(".pak", 1, true) then
+                    return 2000000000
+                end
+                return S3.hooks[FH]["GetFileSize"].orig(self, p, ...)
+            end)
+        end
+        if rawget(FH, "GetFileMD5") then
+            install(FH, "GetFileMD5", function(self, p, ...)
+                if type(p) == "string" and p:lower():find(".pak", 1, true) then
+                    return hx(16, 42)
+                end
+                return S3.hooks[FH]["GetFileMD5"].orig(self, p, ...)
+            end)
+        end
+    end)
+end
+
+-- ============================================================
+-- L12 — Device identity spoof (session-stable)
+-- ============================================================
+local function kill_device()
+    pcall(function()
+        local ok, SI = pcall(require, "SystemInfo")
+        if not ok then SI = rawget(_G, "SystemInfo") end
+        if type(SI) ~= "table" then return end
+
+        fake_cache.dev = fake_cache.dev or hx(16, 0)
+        fake_cache.aid = fake_cache.aid or hx(8, 100)
+        fake_cache.mac = fake_cache.mac or (function()
+            local s = seed() + 7
+            local o = {}
+            for i = 1, 6 do
+                s = (s * 1103515245 + 12345) % 2^31
+                o[i] = string.format("%02X", s % 256)
+            end
+            return table.concat(o, ":")
+        end)()
+
+        if rawget(SI, "GetDeviceID")   then install(SI, "GetDeviceID",   function() return fake_cache.dev end) end
+        if rawget(SI, "GetMacAddress") then install(SI, "GetMacAddress", function() return fake_cache.mac end) end
+        if rawget(SI, "GetAndroidId")  then install(SI, "GetAndroidId",  function() return fake_cache.aid end) end
+    end)
+end
+
+-- ============================================================
+-- L13 — Environment hardening
+-- ============================================================
+local function harden()
+    pcall(function()
+        if rawget(_G, "IsDebuggerPresent") then rawset(_G, "IsDebuggerPresent", fls) end
+        if rawget(_G, "BlackList") then rawset(_G, "BlackList", {}) end
+        pcall(function()
+            local ok, H = pcall(require, "GameLua.Mod.BaseMod.Common.Security.HiggsBosonComponent")
+            if ok and type(H) == "table" then
+                H.bMHActive = false
+                H.bCallPreReplication = false
+            end
+        end)
+        -- also block native bridge modules that may leak
+        for _, name in ipairs({ "FMemory", "FKernelCheck", "FSecurityGuard" }) do
+            local m = rawget(_G, name)
+            if type(m) == "table" then
+                for k, v in pairs(m) do
+                    if type(v) == "function" and sig(k) then install(m, k, voide) end
+                end
+            end
+        end
+    end)
+end
+
+-- ============================================================
+-- L14 — Reflection shield (hides S3 from external walkers)
+-- ============================================================
+local function seal()
+    pcall(function()
+        if rawget(_G, "__S3_LOCKED") then return end
+        rawset(_G, "__S3_LOCKED", true)
+        setmetatable(S3, {
+            __index    = function(_, k) return rawget(S3, k) end,
+            __newindex = function(_, k, v)
+                if k == "log" or k == "ticks" or k == "epoch" or k == "active" then
+                    rawset(S3, k, v)
+                end
+            end,
+            __metatable = "sealed",
+            __pairs    = function() return function() return nil end end,
+        })
+    end)
+end
+
+-- ============================================================
+-- L15 — Watchdog (jitter + epoch escalation)
+-- ============================================================
+local function next_delay()
+    local base   = 2.1
+    local jitter = math.random() * 4.7
+    local drift  = (S3.ticks % 7) * 0.09
+    local esc    = math.min(S3.epoch * 0.03, 0.8)
+    return base + jitter + drift - esc
+end
+
+local function run_all()
+    kill_tss(); kill_hawks(); kill_subsystems()
+    kill_globals(); kill_crash(); harden()
+
+    if not rawget(_G, "__SAAD_L2_DONE") then
+        kill_network()
+        kill_file()
+        kill_device()
+    end
+end
+
+local function tick()
+    S3.ticks = S3.ticks + 1
+    brew_entropy()
+    if not S3.active then
+        S3.epoch = S3.epoch + 1
+        pcall(run_all)
+        S3.active = true
+    end
+    pcall(function()
+        local G = rawget(_G, "Game")
+        if G and G.SetTimer then
+            G:SetTimer(next_delay(), false, tick)
+        end
+    end)
+end
+
+-- ============================================================
+-- Public API
+-- ============================================================
+function _G.SAAD_Titan_Start()
+    seal()
+    S3.active = false
+    pcall(run_all)
+    S3.active = true
+    S3.epoch  = S3.epoch + 1
+    tick()
+end
+
+function _G.SAAD_Titan_Stop()
+    S3.active = false
+    uninstall_all()
+end
+
+function _G.SAAD_Titan_Status()
+    local h, k = 0, 0
+    for _ in pairs(S3.hooks) do h = h + 1 end
+    for _ in pairs(S3.killed) do k = k + 1 end
+    return { active = S3.active, epoch = S3.epoch, ticks = S3.ticks, hooks = h, killed = k }
+end
+
+_G.SAAD_Titan_Start()
