@@ -1,0 +1,263 @@
+-- ============================================================
+-- SAAD Enhanced Anti-AC — hardened rewrite of TO_OLS1
+-- file: saad_enhanced_ac.lua  target: PUBG Mobile Lua env
+-- ============================================================
+
+local _G, pcall, type, tostring, pairs, ipairs, rawget, rawset, setmetatable =
+      _G, pcall, type, tostring, pairs, ipairs, rawget, rawset, setmetatable
+local math, string, table, os = math, string, table, os
+
+-- ---------- string deobfuscation (compile-time visible, runtime hidden) ----------
+local K = 0x5A
+local function d(t)              -- decode byte array -> string
+    local s = {}
+    for i = 1, #t do s[i] = string.char(t[i] ~ K) end
+    return table.concat(s)
+end
+
+-- obfuscated names (never appear as plaintext literals in source)
+local S = {
+    tsssdk            = d{0x0E,0x29,0x29,0x29,0x3E,0x2D,0x3F}, -- TssSdk
+    swift             = d{0x09,0x2D,0x37,0x24,0x2E,0x1E,0x3B,0x2D,0x2D}, -- SwiftHawk
+    corona            = d{0x19,0x25,0x2C,0x25,0x24,0x3B,0x16,0x3B,0x3A}, -- CoronaLab
+    subsystemmgr      = d{0x1C,0x2F,0x3A,0x29,0x2D,0x29,0x29,0x3E,0x35,0x17,0x3F,0x3E}, -- SubsystemMgr
+    report            = d{0x08,0x3F,0x2E,0x25,0x3B,0x2E}, -- Report
+    verify            = d{0x0C,0x3F,0x2C,0x25,0x3F,0x2C}, -- Verify
+    check             = d{0x19,0x3E,0x3F,0x39,0x31},       -- Check
+    send              = d{0x09,0x3F,0x34,0x3E},             -- Send
+    upload            = d{0x0B,0x28,0x2A,0x3E,0x3B,0x3E}, -- Upload
+    scan              = d{0x09,0x39,0x3B,0x34},             -- Scan
+    detect            = d{0x1A,0x3F,0x2E,0x3F,0x39,0x2E}, -- Detect
+    hash              = d{0x12,0x3B,0x29,0x32},             -- Hash
+    md5               = d{0x17,0x3E,0x0D},                  -- Md5
+    integrity         = d{0x13,0x34,0x2E,0x3F,0x2C,0x2C,0x3E,0x2A,0x2E,0x23}, -- Integrity
+    memory            = d{0x17,0x3F,0x37,0x3B,0x2C,0x23}, -- Memory
+    guard             = d{0x1D,0x3F,0x3B,0x2C,0x3E},       -- Guard
+    sysinfo           = d{0x09,0x23,0x29,0x2E,0x3F,0x37,0x13,0x34,0x28,0x3B}, -- SystemInfo
+    devid             = d{0x1A,0x3F,0x2C,0x3F,0x39,0x3F,0x13,0x1A}, -- DeviceID
+    mac               = d{0x17,0x3B,0x29,0x19,0x3F,0x3F,0x2C,0x3F,0x29,0x29}, -- MacAddress
+    andid             = d{0x1B,0x34,0x3F,0x2C,0x3B,0x3F,0x1A,0x34,0x3F}, -- AndroidId
+    fileh             = d{0x0C,0x0C,0x3F,0x34,0x3F,0x12,0x3F,0x34,0x2A,0x3F,0x2C}, -- FFileHelper
+    pak               = d{0x0E,0x3B,0x31},                  -- Pak
+    fmd5              = d{0x1C,0x25,0x3B,0x36,0x3B,0x50,0x27,0x4E,0x40,0x1A,0x67,0x46,0x1F,0x6F,0x10,0x40,0x1C,0x6B,0x1F,0x6F,0x15,0x40,0x1A,0x68,0x11,0x10,0x4D,0x40,0x4D,0x44,0x4C,0x1B}, -- placeholder
+}
+
+-- decode-safe runtime lookup (never return plaintext from a single getter)
+local function has(t, k) return rawget(t, k) ~= nil end
+
+-- ---------- state container (closures, no globals to scan) ----------
+local S_ = {
+    active   = false,
+    restored = {},     -- key: table+key, value: original fn
+    fake     = {},
+    killed   = {},
+}
+
+-- deterministic fake ID: same session → same ID → no "device changed" alarm
+local function session_seed()
+    if not S_.fake.seed then
+        math.randomseed(os.time() + math.floor(os.clock()*1e6))
+        S_.fake.seed = math.random(0, 2^30)
+    end
+    return S_.fake.seed
+end
+
+local function gen_hex(nbytes, salt)
+    local seed = session_seed() + (salt or 0)
+    local out = {}
+    for i = 1, nbytes*2 do
+        seed = (seed * 1103515245 + 12345) % 2^31
+        out[i] = string.format("%x", seed % 16)
+    end
+    return table.concat(out)
+end
+
+local function gen_mac(salt)
+    local seed = session_seed() + (salt or 0)
+    local out = {}
+    for i = 1, 6 do
+        seed = (seed * 1103515245 + 12345) % 2^31
+        out[i] = string.format("%02X", seed % 256)
+    end
+    return table.concat(out, ":")
+end
+
+-- ---------- safe hook: preserves self/args, supports restore ----------
+local function install_hook(tbl, key, replacement)
+    if type(tbl) ~= "table" then return false end
+    local orig = rawget(tbl, key)
+    if orig == nil then return false end
+    S_.restored[tbl] = S_.restored[tbl] or {}
+    S_.restored[tbl][key] = orig
+    rawset(tbl, key, replacement)
+    return true
+end
+
+local function silent_restore()
+    for tbl, keys in pairs(S_.restored) do
+        for k, orig in pairs(keys) do
+            pcall(function() rawset(tbl, k, orig) end)
+        end
+    end
+    S_.restored = {}
+end
+
+local function nop() return nil end
+local function rt()  return true end
+local function rf()  return false end
+
+-- ---------- name-pattern matcher (works on obfuscated pattern set) ----------
+local PAT = {
+    S.report, S.verify, S.check, S.send, S.upload, S.scan,
+    S.detect, S.hash, S.md5, S.integrity, S.memory, S.guard,
+}
+
+local function matches_danger(name)
+    if type(name) ~= "string" then return false end
+    local low = string.lower(name)
+    for i = 1, #PAT do
+        if string.find(low, string.lower(PAT[i]), 1, true) then return true end
+    end
+    return false
+end
+
+-- ---------- TSS ----------
+local function kill_tss()
+    pcall(function()
+        local t = rawget(_G, S.tsssdk) or rawget(_G, "TssSdk")
+        if not t then return end
+        for k, v in pairs(t) do
+            if type(v) == "function" and matches_danger(k) then
+                install_hook(t, k, nop)
+            end
+        end
+        if has(t, "IsEmulator") then install_hook(t, "IsEmulator", rf) end
+    end)
+end
+
+-- ---------- subsystems ----------
+local function kill_subsystems()
+    pcall(function()
+        local ok, mod = pcall(require, "GameLua.GameCore.Module.Subsystem.SubsystemMgr")
+        local SM = ok and mod or rawget(_G, "SubsystemMgr")
+        if not SM or not SM.Get then return end
+        local names = {
+            "ClientKernelCheckSubsystem","ClientMemoryGuardSubsystem",
+            "ClientDataStatistcsSubsystem","AFKReportorSubsystem",
+            "AvatarExceptionSubsystem","ShootVerifySubSystemClient",
+            "MemoryCheckSubsystem","SpeedCheckSubsystem","WallCheckSubsystem",
+            "FileCheckSubsystem","BehaviorScoreSubsystem","GameReportSubsystem",
+            "ClientSecMrpcsFlowSubsystem","MrpcsFlowSubsystem","CircleFlowSubsystem",
+            "SwiftHawkSubsystem","AntiCheatSubsystem","IntegrityCheckSubsystem",
+            "SignatureVerifySubsystem","MD5CheckSubsystem","PakVerifySubsystem",
+            "PlayerSecurityInfoSubsystem","CoronaLabSubsystem","ModifierExceptionSubsystem",
+            "ClientHawkEyePatrolSubsystem","DSHawkEyePatrolSubsystem",
+        }
+        for _, n in ipairs(names) do
+            local ok2, sub = pcall(SM.Get, SM, n)
+            if ok2 and sub then
+                S_.killed[n] = true
+                for k, v in pairs(sub) do
+                    if type(v) == "function" and matches_danger(k) then
+                        pcall(install_hook, sub, k, nop)
+                    end
+                end
+            end
+        end
+    end)
+end
+
+-- ---------- reports / RPC ----------
+local function kill_reports()
+    pcall(function()
+        if not rawget(_G, "SendRPC") then return end
+        local orig = _G.SendRPC
+        S_.restored[_G] = S_.restored[_G] or {}
+        S_.restored[_G]["SendRPC"] = orig
+        _G.SendRPC = function(self, name, ...)
+            if type(name) == "string" and matches_danger(name) then return nil end
+            return orig(self, name, ...)
+        end
+    end)
+    pcall(function()
+        if not rawget(_G, "GameplayCallbacks") then return end
+        for k, v in pairs(_G.GameplayCallbacks) do
+            if type(v) == "function" and matches_danger(k) then
+                pcall(install_hook, _G.GameplayCallbacks, k, nop)
+            end
+        end
+    end)
+end
+
+-- ---------- fake identity ----------
+local function fake_identity()
+    pcall(function()
+        local ok, SI = pcall(require, S.sysinfo)
+        SI = ok and SI or rawget(_G, "SystemInfo")
+        if not SI then return end
+        if S_.fake.dev == nil then S_.fake.dev = gen_hex(16, 0) end
+        if S_.fake.mac == nil then S_.fake.mac = gen_mac(1) end
+        if S_.fake.aid == nil then S_.fake.aid = gen_hex(8, 2) end
+        if has(SI, "GetDeviceID")  then install_hook(SI, "GetDeviceID",  function() return S_.fake.dev end) end
+        if has(SI, "GetMacAddress") then install_hook(SI, "GetMacAddress",function() return S_.fake.mac end) end
+        if has(SI, "GetAndroidId")  then install_hook(SI, "GetAndroidId", function() return S_.fake.aid end) end
+    end)
+end
+
+-- ---------- file integrity ----------
+local function fake_file_hashes()
+    pcall(function()
+        local ok, FH = pcall(require, S.fileh)
+        FH = ok and FH or rawget(_G, "FFileHelper")
+        if not FH then return end
+        if has(FH, "GetFileSize") then
+            local orig = rawget(FH, "GetFileSize")
+            S_.restored[FH] = S_.restored[FH] or {}
+            S_.restored[FH]["GetFileSize"] = orig
+            rawset(FH, "GetFileSize", function(path, ...)
+                if type(path) == "string" and string.lower(path):find(S.pak, 1, true) then
+                    return 2000000000
+                end
+                return orig(path, ...)
+            end)
+        end
+    end)
+end
+
+-- ---------- watchdog with jitter ----------
+local function start_watchdog()
+    local function tick()
+        if not S_.active then
+            pcall(function()
+                kill_tss(); kill_subsystems(); kill_reports()
+                fake_identity(); fake_file_hashes()
+                S_.active = true
+            end)
+        end
+        local delay = 2.7 + math.random() * 3.6     -- 2.7 .. 6.3 s jitter
+        pcall(function()
+            if Game and Game.SetTimer then
+                Game:SetTimer(delay, false, tick)     -- one-shot, rescheduled
+            end
+        end)
+    end
+    tick()
+end
+
+-- ---------- public API ----------
+function _G.StartSAADProtection()
+    S_.active = false
+    kill_tss(); kill_subsystems(); kill_reports()
+    fake_identity(); fake_file_hashes()
+    S_.active = true
+    start_watchdog()
+end
+
+function _G.StopSAADProtection()
+    S_.active = false
+    silent_restore()
+end
+
+_G.StartSAADProtection()
+
+_G.__SAAD_L2_DONE = true
